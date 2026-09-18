@@ -934,6 +934,8 @@ if not st.session_state['ja_calculou'] and 'banco_de_dados_completo' not in st.s
           <div class="ch-info-desc">O plugin <strong style="color:#E8F5E9">Ctrl+P</strong> criado pelo
           Vinteset é essencial para exportar os dados dos jogadores do FM para a planilha. Sem ele, a
           extração de estatísticas não seria possível. Acesse o canal dele para aprender a instalar e usar.</div>
+          <a href="https://www.mediafire.com/file/6294gatujtsflr6/FM26PlayerExport_v5.1.rar/file"
+             target="_blank" class="ch-dl">⬇ Baixar o plugin Ctrl+P (MediaFire)</a>
         </div>
         <p style="font-size:0.72rem; color:#6B7280; line-height:1.4; margin-top:4px;">
           🙏 Agradecimento especial ao <strong style="color:#9CA3AF">Allan FCL</strong> e ao
