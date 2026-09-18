@@ -1057,6 +1057,22 @@ erros_calculo = st.session_state.get('erros_calculo', {})
 # ==========================================
 # HELPER: monta df_filtrado para uma posição
 # ==========================================
+def _obter_modelo_ia():
+    """Retorna (modelo, None) se a chave do Gemini estiver configurada; caso
+    contrário (None, mensagem). Evita que a página quebre quando o segredo falta."""
+    try:
+        chave = st.secrets["CHAVE_API_GEMINI"]
+    except Exception:
+        return None, ("🔑 A IA do Olheiro não está configurada: falta o segredo "
+                      "**CHAVE_API_GEMINI**. Adicione-o nos *secrets* do app "
+                      "(local: `.streamlit/secrets.toml`; no Streamlit Cloud: Settings → Secrets).")
+    try:
+        genai.configure(api_key=chave)
+        return genai.GenerativeModel('gemini-3.1-flash-lite-preview'), None
+    except Exception as e:
+        return None, f"Não foi possível iniciar a IA do Olheiro: {e}"
+
+
 def montar_df(posicao):
     if posicao not in rankings or posicao not in banco_completo:
         return None, None
@@ -1359,26 +1375,99 @@ def render_secao(posicao, df_filtrado, df_da_posicao, secao):
         st.caption("Análise gerada por inteligência artificial com base nos dados Moneyball.")
 
         chave_ia = f'relatorio_ia_{posicao}'
-        CHAVE_API = st.secrets["CHAVE_API_GEMINI"]
-        genai.configure(api_key=CHAVE_API)
-        modelo_ia = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
+        modelo_ia, _erro_ia = _obter_modelo_ia()
+        if modelo_ia is None:
+            st.warning(_erro_ia)
+            return
 
         if chave_ia not in st.session_state:
             if st.button(":material/play_arrow: Gerar relatório do olheiro", type="primary",
                          key=f"btn_ia_{posicao}"):
                 with st.spinner("O Olheiro IA está analisando e redigindo o relatório..."):
-                    dados_top = df_filtrado.head(10).to_dict('records')
+                    # Confiabilidade por jogador (padrão + avançada)
+                    conf_lookup, adv_lookup = {}, {}
+                    try:
+                        _df_conf, _, _ = confi.calcular_confiabilidade(df_da_posicao, posicao)
+                        if _df_conf is not None:
+                            conf_lookup = {r['Jogador']: r for r in _df_conf.to_dict('records')}
+                    except Exception:
+                        pass
+                    try:
+                        _bundle_adv = confi.calcular_avancado(df_da_posicao, posicao)
+                        if _bundle_adv is not None:
+                            adv_lookup = {r['Jogador']: r for r in _bundle_adv['df'].to_dict('records')}
+                    except Exception:
+                        pass
+
+                    # Margem de erro do cálculo AHP (reusa o cache do dashboard se houver)
+                    _mk = f"margem_ahp_{posicao}"
+                    margem_info = st.session_state.get(_mk)
+                    if margem_info is None:
+                        try:
+                            margem_info = main.estimar_margem_ahp(
+                                df_da_posicao, posicao, st.session_state['niveis_usuario'].get(posicao))
+                            st.session_state[_mk] = margem_info
+                        except Exception:
+                            margem_info = None
+                    margem_lookup = {}
+                    if margem_info is not None:
+                        margem_lookup = {j: float(mg) for j, mg in
+                                         zip(margem_info['jogadores'], margem_info['margem'])}
+
+                    # Enriquece os dados dos candidatos com confiabilidade e margem de erro
+                    dados_top = []
+                    for row in df_filtrado.head(10).to_dict('records'):
+                        nome = row.get('Jogador')
+                        if nome in conf_lookup:
+                            row['Score_Confiabilidade'] = round(float(conf_lookup[nome].get('Score_Confiabilidade', float('nan'))), 1)
+                            row['Indice_Risco_Confiab'] = round(float(conf_lookup[nome].get('Indice_Risco', float('nan'))), 1)
+                        if nome in adv_lookup:
+                            row['Estabilidade'] = round(float(adv_lookup[nome].get('Estabilidade', float('nan'))), 0)
+                            row['Consistencia'] = round(float(adv_lookup[nome].get('Consistencia', float('nan'))), 0)
+                            row['Confianca_Amostra'] = round(float(adv_lookup[nome].get('Confianca', float('nan'))), 0)
+                        if nome in margem_lookup:
+                            row['Margem_Erro_Nota'] = round(margem_lookup[nome], 1)
+                        dados_top.append(row)
+
+                    _cr = margem_info['cr'] if margem_info else None
+                    _mm = margem_info['margem_media'] if margem_info else None
+                    contexto_margem = (
+                        f"Margem média de erro da posição: ± {_mm:.1f} pontos na Nota_Moneyball "
+                        f"(Razão de Consistência dos pesos CR={_cr:.2f})."
+                        if margem_info else
+                        "Margem de erro não disponível para esta posição."
+                    )
+
                     prompt = f"""
                     Você é o Olheiro Chefe de um time de futebol que usa a filosofia Moneyball.
                     Aqui estão os melhores candidatos para a posição {posicao}:
                     {dados_top}
+
+                    {contexto_margem}
+
+                    Entenda os campos extras de cada jogador:
+                    - Score_Confiabilidade (0–100): o quão confiável é o desempenho dele frente aos pares da posição (maior = melhor).
+                    - Indice_Risco_Confiab (0–100): tendência a erros/perda de posse (menor = melhor).
+                    - Estabilidade (0–100): o quanto a performance se sustenta (baixa = pode oscilar).
+                    - Consistencia (0–100): equilíbrio entre todas as qualidades.
+                    - Confianca_Amostra (0–100): confiança estatística conforme os minutos jogados.
+                    - Margem_Erro_Nota: o quanto a Nota_Moneyball pode variar para mais ou para menos.
 
                     Escreva um texto direto e profissional para o treinador.
                     Recomende a contratação de 3 jogadores justificando o custo-benefício e analisando os dados
                     em relação aos outros candidatos. Ignore a data de contrato.
                     Observe que m é mil e M é milhão. 200m € é igual a 200 mil de euros por exemplo.
                     Compare a quantidade de partidas — poucos jogos tornam dados menos confiáveis.
-                    Faça uma análise breve de cada um e depois uma conclusão final recomendando o melhor alvo.
+
+                    IMPORTANTE — leve em conta a incerteza do cálculo:
+                    - Quando a diferença de Nota_Moneyball entre dois jogadores for MENOR que a soma das margens
+                      de erro deles, trate como um "empate técnico" e use a confiabilidade (Score_Confiabilidade,
+                      Estabilidade, Consistencia) e a Confianca_Amostra para desempatar.
+                    - Valorize jogadores confiáveis e consistentes; desconfie de uma nota alta que venha com risco
+                      elevado, baixa estabilidade ou poucos minutos.
+
+                    Faça uma análise breve de cada um e depois uma conclusão final recomendando o melhor alvo,
+                    citando quando uma vantagem estiver dentro da margem de erro.
 
                     Assine o final como Olheiro IA.
                     """
@@ -1831,9 +1920,10 @@ def render_secao_overall(posicao, df_filtrado, df_da_posicao, secao):
         st.caption("Análise gerada por inteligência artificial com base no Rating Overall.")
 
         chave_ia = f'relatorio_ia_{posicao}'
-        CHAVE_API = st.secrets["CHAVE_API_GEMINI"]
-        genai.configure(api_key=CHAVE_API)
-        modelo_ia = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
+        modelo_ia, _erro_ia = _obter_modelo_ia()
+        if modelo_ia is None:
+            st.warning(_erro_ia)
+            return
 
         if chave_ia not in st.session_state:
             if st.button(":material/play_arrow: Gerar relatório do olheiro", type="primary",
@@ -2141,9 +2231,10 @@ def render_secao_time(posicao, secao):
         perspectiva_ativa = st.session_state[chave_persp]
         chave_ia = f'relatorio_ia_{posicao}_{perspectiva_ativa}'
 
-        CHAVE_API = st.secrets["CHAVE_API_GEMINI"]
-        genai.configure(api_key=CHAVE_API)
-        modelo_ia = genai.GenerativeModel('gemini-3.1-flash-lite-preview')
+        modelo_ia, _erro_ia = _obter_modelo_ia()
+        if modelo_ia is None:
+            st.warning(_erro_ia)
+            return
 
         st.space("small")
 
