@@ -408,9 +408,9 @@ if st.session_state.get('reiniciando'):
         if key in st.session_state:
             del st.session_state[key]
     for pos in POSICOES_TODAS:
-        k = f'relatorio_ia_{pos}'
-        if k in st.session_state:
-            del st.session_state[k]
+        for k in (f'relatorio_ia_{pos}', f'margem_ahp_{pos}'):
+            if k in st.session_state:
+                del st.session_state[k]
     k_time = f'relatorio_ia_{POSICAO_TIME}'
     if k_time in st.session_state:
         del st.session_state[k_time]
@@ -784,6 +784,9 @@ if not st.session_state['ja_calculou'] and 'banco_de_dados_completo' not in st.s
             "Nova seção Confiabilidade — Score de Confiabilidade (0–100) por jogador, com métricas específicas de cada posição",
             "Índice composto ponderado por percentis: compara o jogador contra os pares da mesma posição e penaliza mais os erros graves (ex.: erro que gera gol)",
             "Barras de percentil por métrica, radar comparativo entre dois jogadores e matriz de risco (produção × erros)",
+            "Confiabilidade agora tem duas abas: Análise padrão e Análise avançada (Índice geral, Estabilidade, Consistência, Confiança e prioridade de evolução por jogador)",
+            "Botão de download do plugin Ctrl+P (Vinteset) na tela inicial",
+            "Margem de erro do cálculo no Dashboard — mostra o quanto a nota pode variar conforme os pesos escolhidos",
         ]
         for n in v26:
             st.markdown(f'<div class="update-item">• {n}</div>', unsafe_allow_html=True)
@@ -1232,6 +1235,39 @@ def render_secao(posicao, df_filtrado, df_da_posicao, secao):
                 st.altair_chart(scatter + labels)
             else:
                 st.caption("Coluna 'Nota média' não encontrada para esta posição.")
+
+        # Margem de erro do cálculo — discreta, no rodapé do dashboard
+        _mk = f"margem_ahp_{posicao}"
+        if _mk not in st.session_state:
+            try:
+                st.session_state[_mk] = main.estimar_margem_ahp(
+                    df_da_posicao, posicao, st.session_state['niveis_usuario'].get(posicao))
+            except Exception:
+                st.session_state[_mk] = None
+        margem_info = st.session_state[_mk]
+
+        if margem_info is not None and len(margem_info.get('margem', [])):
+            st.space("small")
+            with st.expander(f"🎯 Margem de erro do cálculo · ± {margem_info['margem_media']:.1f} pts"):
+                m_lookup = {j: (no, lo, hi, mg) for j, no, lo, hi, mg in zip(
+                    margem_info['jogadores'], margem_info['nota'], margem_info['lo'],
+                    margem_info['hi'], margem_info['margem'])}
+                st.caption("A nota depende dos pesos dados aos critérios. Como esses pesos são um "
+                           "julgamento, testamos centenas de variações plausíveis e medimos o quanto "
+                           "a nota oscila. Quanto menor a margem, mais firme é a nota.")
+                cons_txt = "coerentes ✅" if margem_info['consistente'] else "atenção ⚠️"
+                st.caption(f"Margem média da posição: **± {margem_info['margem_media']:.1f} pts** · "
+                           f"pesos {cons_txt} (CR {margem_info['cr']:.2f}).")
+                alvo_m = m_lookup.get(alvo['Jogador'])
+                if alvo_m:
+                    empatados = [j for j, (no, lo, hi, mg) in m_lookup.items()
+                                 if j != alvo['Jogador'] and hi >= alvo_m[1]]
+                    st.caption(f"Líder **{alvo['Jogador']}**: {alvo_m[0]:.1f} ± {alvo_m[3]:.1f} pts.")
+                    if empatados:
+                        st.caption(f"⚠️ {len(empatados)} jogador(es) dentro da margem do líder — "
+                                   f"a vantagem não é definitiva.")
+                    else:
+                        st.caption("✅ O líder se mantém à frente mesmo considerando a margem.")
 
 
 
@@ -2205,7 +2241,7 @@ def _radar_confiabilidade(df_perc, jogador_a, jogador_b, plt):
     angulos = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
     angulos += angulos[:1]
 
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+    fig, ax = plt.subplots(figsize=(4.3, 4.3), subplot_kw=dict(polar=True))
     fig.patch.set_facecolor('#0A0F0C')
     ax.set_facecolor('#0A0F0C')
 
@@ -2226,15 +2262,50 @@ def _radar_confiabilidade(df_perc, jogador_a, jogador_b, plt):
     ax.set_ylim(0, 100)
     ax.spines['polar'].set_color('#1E3A24')
     ax.grid(color='#1E3A24', linewidth=0.8)
-    ax.set_title('Percentis de confiabilidade (0–100)', color='#E8F5E9', fontsize=11, pad=20)
-    ax.legend(loc='upper right', bbox_to_anchor=(1.28, 1.12), facecolor='#0A0F0C',
-              edgecolor='#1E3A24', labelcolor='#E8F5E9', fontsize=8)
+    ax.set_title('Percentis de confiabilidade (0–100)', color='#E8F5E9', fontsize=10, pad=16)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.22, 1.14), facecolor='#0A0F0C',
+              edgecolor='#1E3A24', labelcolor='#E8F5E9', fontsize=7)
+    fig.tight_layout()
+    return fig
+
+
+def _fig_kde_confiabilidade(grid, dens, cdf, x_jogador, rotulo, coluna, plt):
+    """Curva de densidade (KDE) de uma métrica com a área integral até o valor do
+    jogador (= percentil) sombreada e a densidade local (= derivada da CDF) anotada."""
+    import numpy as np
+    perc = float(np.interp(x_jogador, grid, cdf, left=0.0, right=1.0))
+    dloc = float(np.interp(x_jogador, grid, dens, left=0.0, right=0.0))
+
+    fig, ax = plt.subplots(figsize=(5.4, 2.6))
+    fig.patch.set_facecolor('#0A0F0C')
+    ax.set_facecolor('#0A0F0C')
+    ax.plot(grid, dens, color='#4ADE80', linewidth=2)
+    mask = grid <= x_jogador
+    ax.fill_between(grid[mask], dens[mask], color='#22C55E', alpha=0.30)
+    ax.axvline(x_jogador, color='#F59E0B', linewidth=2)
+    ax.plot([x_jogador], [dloc], marker='o', color='#F59E0B', markersize=7, zorder=5)
+
+    ax.set_title(f"{rotulo} — distribuição dos jogadores", color='#E8F5E9', fontsize=11)
+    ax.set_xlabel(str(coluna), color='#9CA3AF', fontsize=8)
+    ax.set_ylabel('nº de jogadores', color='#9CA3AF', fontsize=8)
+    ax.tick_params(colors='#6B7280', labelsize=7)
+    ax.set_yticks([])
+    for lado in ('top', 'right'):
+        ax.spines[lado].set_visible(False)
+    for lado in ('left', 'bottom'):
+        ax.spines[lado].set_color('#1E3A24')
+    ax.grid(color='#132018', linewidth=0.7)
+    ax.annotate(f"Percentil: {perc * 100:.0f}",
+                xy=(0.98, 0.94), xycoords='axes fraction', ha='right', va='top',
+                fontsize=9, color='#E8F5E9',
+                bbox=dict(boxstyle='round', facecolor='#08120C', edgecolor='#1E3A24'))
     fig.tight_layout()
     return fig
 
 
 def render_confiabilidade(posicao, df_da_posicao):
-    """Renderiza a seção de Score de Confiabilidade para uma posição."""
+    """Renderiza a seção de Score de Confiabilidade para uma posição, em duas abas:
+    análise padrão e análise avançada."""
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
@@ -2254,6 +2325,15 @@ def render_confiabilidade(posicao, df_da_posicao):
                    "(mínimo de jogadores ou de métricas não atingido).")
         return
 
+    aba_padrao, aba_avancada = st.tabs(["📊 Análise padrão", "🔬 Análise avançada"])
+    with aba_padrao:
+        _render_confiabilidade_padrao(posicao, df_scores, df_perc, usadas, plt)
+    with aba_avancada:
+        _render_confiabilidade_avancada(posicao, df_da_posicao, plt)
+
+
+def _render_confiabilidade_padrao(posicao, df_scores, df_perc, usadas, plt):
+    """Aba de análise padrão da confiabilidade (ranking, percentis, radar, matriz de risco)."""
     sent = {u['label']: u['sentido'] for u in usadas}
     pos_labels = [l for l, s in sent.items() if s == 1]
     neg_labels = [l for l, s in sent.items() if s == -1]
@@ -2314,30 +2394,127 @@ def render_confiabilidade(posicao, df_da_posicao):
     j_b = cc2.selectbox("Jogador B", jogadores,
                         index=1 if len(jogadores) > 1 else 0, key=f"confi_radar_b_{posicao}")
     fig = _radar_confiabilidade(df_perc, j_a, j_b, plt)
-    st.pyplot(fig)
+    col_r = st.columns([1, 2, 1])[1]
+    col_r.pyplot(fig, use_container_width=False)
     plt.close(fig)
 
-    # ---- 3) Matriz de risco ----
+    # ---- 3) Matriz de risco (nome só no hover) ----
     st.markdown("#### ⚠️ Matriz de risco")
-    st.caption("Canto **superior-esquerdo** = alta produção e baixo risco: os jogadores mais confiáveis.")
+    st.caption("Canto **superior-esquerdo** = alta produção e baixo risco: os jogadores mais "
+               "confiáveis. Passe o mouse sobre um ponto para ver o jogador.")
     base = alt.Chart(df_scores).encode(
         x=alt.X('Indice_Risco:Q', scale=alt.Scale(domain=[0, 100]), title='Índice de risco (erros) →'),
         y=alt.Y('Indice_Positivo:Q', scale=alt.Scale(domain=[0, 100]), title='Índice positivo (produção) →'),
     )
     pontos = base.mark_circle(size=150, opacity=0.85).encode(
         color=alt.Color('Score_Confiabilidade:Q', scale=alt.Scale(scheme='greens'), title='Score'),
-        tooltip=['Jogador:N', alt.Tooltip('Score_Confiabilidade:Q', format='.0f'),
-                 alt.Tooltip('Indice_Positivo:Q', format='.0f'),
-                 alt.Tooltip('Indice_Risco:Q', format='.0f')],
+        tooltip=['Jogador:N', alt.Tooltip('Score_Confiabilidade:Q', title='Score', format='.0f'),
+                 alt.Tooltip('Indice_Positivo:Q', title='Produção', format='.0f'),
+                 alt.Tooltip('Indice_Risco:Q', title='Risco', format='.0f')],
     )
-    rotulos_pts = base.mark_text(align='left', dx=8, dy=-6, fontSize=10, color='#E8F5E9').encode(
-        text='Jogador:N')
     reg_x = alt.Chart(pd.DataFrame({'x': [float(df_scores['Indice_Risco'].median())]})).mark_rule(
         color='#6B7280', strokeDash=[4, 4]).encode(x='x:Q')
     reg_y = alt.Chart(pd.DataFrame({'y': [float(df_scores['Indice_Positivo'].median())]})).mark_rule(
         color='#6B7280', strokeDash=[4, 4]).encode(y='y:Q')
-    st.altair_chart((reg_x + reg_y + pontos + rotulos_pts).properties(height=460),
+    st.altair_chart((reg_x + reg_y + pontos).properties(height=420).interactive(),
                     use_container_width=True)
+
+
+def _render_confiabilidade_avancada(posicao, df_da_posicao, plt):
+    """Aba de análise avançada: métricas derivadas de integral (KDE/CDF, entropia) e
+    derivada (densidade local, gradiente do score)."""
+    st.caption("Uma leitura mais fina de cada jogador, além do ranking simples.")
+
+    bundle = confi.calcular_avancado(df_da_posicao, posicao)
+    if bundle is None:
+        st.info("Poucos jogadores nesta posição para a análise avançada.")
+        return
+
+    df_adv = bundle['df']
+    sent = bundle['sent']
+    grids = bundle['grids']
+    valores = bundle['valores']
+    alavancas = bundle['alavancas']
+
+    with st.expander("ℹ️ O que cada índice significa"):
+        st.markdown("""
+        - **Índice geral** — a nota principal desta análise. Ela parte do score e ajusta para
+          baixo quem depende de poucas qualidades ou jogou poucos minutos.
+        - **Estabilidade** — o quanto o desempenho do jogador se sustenta. Alta significa
+          confiável de forma consistente; baixa significa que ele está muito próximo de outros
+          e pode oscilar com facilidade.
+        - **Consistência** — se o jogador é equilibrado em tudo ou se depende de uma qualidade
+          só. Quanto mais parelho, mais confiável.
+        - **Confiança e a margem ±** — o quanto dá para confiar na nota. Quem jogou mais minutos
+          tem uma leitura mais firme; poucos minutos deixam a nota com uma margem maior.
+        - **Prioridade de evolução** — a qualidade onde ele ganharia nota mais rápido se melhorasse.
+        """)
+
+    st.markdown("#### 🏆 Ranking detalhado")
+    col_cfg = {
+        'Indice_Academico': st.column_config.ProgressColumn('Índice geral', min_value=0, max_value=100, format='%.1f'),
+        'Score': st.column_config.NumberColumn('Score base', format='%.0f'),
+        'Estabilidade': st.column_config.NumberColumn('Estabilidade', format='%.0f'),
+        'Consistencia': st.column_config.NumberColumn('Consistência', format='%.0f'),
+        'Confianca': st.column_config.NumberColumn('Confiança', format='%.0f'),
+        'Banda': st.column_config.NumberColumn('± Margem', format='%.0f'),
+    }
+    st.dataframe(df_adv, column_config=col_cfg, hide_index=True, use_container_width=True)
+
+    jogadores = df_adv['Jogador'].tolist()
+    jog = st.selectbox("Inspecionar jogador", jogadores, key=f"adv_jog_{posicao}")
+    linha = df_adv[df_adv['Jogador'] == jog].iloc[0]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Índice geral", f"{linha['Indice_Academico']:.0f}")
+    m2.metric("Estabilidade", f"{linha['Estabilidade']:.0f}", help="O quanto o desempenho se sustenta")
+    m3.metric("Consistência", f"{linha['Consistencia']:.0f}", help="Equilíbrio entre todas as qualidades")
+    banda_txt = "—" if pd.isna(linha['Banda']) else f"± {linha['Banda']:.0f}"
+    m4.metric("Score ± margem", f"{linha['Score']:.0f}", banda_txt, delta_color="off",
+              help="Margem de incerteza conforme os minutos jogados")
+
+    # Prioridade de evolução
+    st.markdown("**🎚️ Prioridade de evolução** — onde este jogador melhoraria mais rápido:")
+    lev = alavancas.get(jog, [])
+    if lev:
+        linhas_lev = []
+        for lab, val in lev:
+            direcao = "aumentar" if sent.get(lab, 1) == 1 else "reduzir"
+            linhas_lev.append(f"- **{lab}** — {direcao} · prioridade {val:.0f}/100")
+        st.markdown("\n".join(linhas_lev))
+    else:
+        st.caption("Jogador já muito completo — pouca coisa a melhorar.")
+
+    # Distribuição da métrica na posição
+    st.markdown("#### 📐 Onde o jogador está na métrica")
+    st.caption("A curva mostra como os jogadores da posição se espalham nessa métrica. "
+               "A linha laranja é onde este jogador está, e a parte preenchida indica o percentil dele.")
+    metrica_sel = st.selectbox("Métrica", bundle['usadas'],
+                               index=0, key=f"adv_kde_{posicao}")
+    if metrica_sel in grids and jog in valores.index:
+        grid, dens, cdf, coluna = grids[metrica_sel]
+        x_jog = float(valores.loc[jog, metrica_sel])
+        if pd.notna(x_jog):
+            fig = _fig_kde_confiabilidade(grid, dens, cdf, x_jog, metrica_sel, coluna, plt)
+            col_k = st.columns([1, 3, 1])[1]
+            col_k.pyplot(fig, use_container_width=False)
+            plt.close(fig)
+        else:
+            st.caption("Sem valor válido desta métrica para o jogador.")
+
+    # Estabilidade × Score — mapa robustez vs qualidade (nome só no hover)
+    st.markdown("#### 🧭 Robustez × Qualidade")
+    st.caption("Direita e acima = confiável **e** robusto. Baixa estabilidade = score sujeito a "
+               "oscilar. Passe o mouse sobre um ponto para ver o jogador.")
+    disp = alt.Chart(df_adv).mark_circle(size=140, opacity=0.85).encode(
+        x=alt.X('Estabilidade:Q', scale=alt.Scale(domain=[0, 100]), title='Estabilidade (robustez) →'),
+        y=alt.Y('Indice_Academico:Q', scale=alt.Scale(domain=[0, 100]), title='Índice geral →'),
+        color=alt.Color('Consistencia:Q', scale=alt.Scale(scheme='greens'), title='Consistência'),
+        tooltip=['Jogador:N', alt.Tooltip('Indice_Academico:Q', title='Índice geral', format='.0f'),
+                 alt.Tooltip('Estabilidade:Q', title='Estabilidade', format='.0f'),
+                 alt.Tooltip('Consistencia:Q', title='Consistência', format='.0f')],
+    )
+    st.altair_chart(disp.properties(height=420).interactive(), use_container_width=True)
 
 
 # Abas disponíveis de acordo com o modo de análise escolhido

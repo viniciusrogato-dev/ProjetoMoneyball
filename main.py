@@ -382,6 +382,162 @@ def gerar_ranking(df_bruto, posicao, niveis_usuario=None):
     return df_final[['Jogador', 'Equipe', 'Nota_Moneyball', 'Valor estimado', 'Idade']]
 
 
+def _preparar_ahp(df_bruto, posicao, niveis_usuario=None):
+    """Reproduz o pré-processamento do ranking Moneyball e devolve as peças do AHP
+    (critérios, matriz de Saaty e a matriz normalizada X de jogadores × critérios),
+    para a análise de margem de erro. Segue exatamente os mesmos passos de
+    gerar_ranking, garantindo que a nota reconstruída (100·X·pesos) seja idêntica.
+    """
+    if posicao not in CRITERIOS_PADRAO:
+        raise ValueError(f"Posição '{posicao}' não reconhecida pelo sistema.")
+    if df_bruto is None or df_bruto.empty:
+        raise ValueError(f"A aba '{posicao}' está vazia na planilha.")
+
+    try:
+        df = df_bruto.loc[:, 'Jogador':'Nota média'].copy()
+    except KeyError:
+        raise ValueError(
+            f"Não foi possível localizar as colunas 'Jogador' e/ou 'Nota média' na aba '{posicao}'."
+        )
+    df = df.dropna(subset=[df.columns[0]])
+    if df.empty:
+        raise ValueError(f"Nenhum jogador encontrado na aba '{posicao}' após remover linhas vazias.")
+
+    nome_col_valor = COLUNA_VALOR_POR_POSICAO.get(posicao, 'Valor estimado')
+    if nome_col_valor not in df.columns:
+        raise ValueError(f"Coluna de valor '{nome_col_valor}' não encontrada na aba '{posicao}'.")
+    df['Valor_Numerico'] = df[nome_col_valor].apply(valor.limpar_valor_mercado)
+    valores_positivos = df[df['Valor_Numerico'] > 0]['Valor_Numerico']
+    if valores_positivos.empty:
+        df['Valor_Numerico'] = 0.0
+    else:
+        val_max_real = valores_positivos.max()
+        val_min_real = valores_positivos.min()
+        df.loc[df['Valor_Numerico'] == -1, 'Valor_Numerico'] = val_max_real * 2
+        df.loc[df['Valor_Numerico'] == -2, 'Valor_Numerico'] = val_min_real + (val_max_real + val_min_real) / 2
+
+    if 'Salário' not in df.columns:
+        df['Salario_Numerico'] = 0.0
+    else:
+        df['Salario_Numerico'] = df['Salário'].apply(valor.limpar_salario)
+
+    nome_col_contrato = COLUNA_CONTRATO_POR_POSICAO.get(posicao, 'Data final de contrato')
+    if nome_col_contrato in df.columns:
+        df['Contrato_Numerico'] = df[nome_col_contrato].apply(data.limpar_data_contrato)
+
+    padrao = CRITERIOS_PADRAO[posicao]
+    colunas_para_ver = [c for c in padrao['colunas'] if c in df.columns]
+    if niveis_usuario:
+        ignorados = {c for c, nv in niveis_usuario.items() if nv == 0}
+        nivel_1 = [c for c, nv in niveis_usuario.items() if nv == 1 and c in df.columns and c not in ignorados]
+        nivel_2 = [c for c, nv in niveis_usuario.items() if nv == 2 and c in df.columns and c not in ignorados]
+        nivel_3 = [c for c, nv in niveis_usuario.items() if nv == 3 and c in df.columns and c not in ignorados]
+        colunas_para_ver = [c for c in colunas_para_ver if c not in ignorados]
+        if len(nivel_1 + nivel_2 + nivel_3) < MIN_CRITERIOS_ATIVOS:
+            raise ValueError(
+                f"São necessários pelo menos {MIN_CRITERIOS_ATIVOS} critérios ativos para {posicao}."
+            )
+    else:
+        nivel_1 = [c for c in padrao['nivel_1'] if c in df.columns]
+        nivel_2 = [c for c in padrao['nivel_2'] if c in df.columns]
+        nivel_3 = [c for c in df.columns if c not in nivel_1 and c not in nivel_2]
+
+    if not colunas_para_ver:
+        raise ValueError(f"Nenhuma coluna de critério encontrada na aba '{posicao}'.")
+
+    def obter_nivel(criterio):
+        if criterio in nivel_1: return 1
+        if criterio in nivel_2: return 2
+        return 3
+
+    criterios = nivel_1 + nivel_2 + nivel_3
+    n = len(criterios)
+    if n == 0:
+        raise ValueError(f"Nenhum critério ativo para calcular o ranking de {posicao}.")
+
+    matriz_saaty = np.ones((n, n))
+    for i in range(n):
+        for j in range(n):
+            if i == j:
+                continue
+            t_i = obter_nivel(criterios[i])
+            t_j = obter_nivel(criterios[j])
+            if   t_i == 1 and t_j == 2: v = 2.0
+            elif t_i == 1 and t_j == 3: v = 9.0
+            elif t_i == 2 and t_j == 3: v = 5.0
+            elif t_i == 2 and t_j == 1: v = 1/2
+            elif t_i == 3 and t_j == 1: v = 1/9
+            elif t_i == 3 and t_j == 2: v = 1/5
+            else: v = 1.0
+            matriz_saaty[i, j] = v
+
+    # Matriz normalizada X (mesma normalização benefício/custo do ranking)
+    df_ranking = df[colunas_para_ver].copy()
+    for col in colunas_para_ver:
+        df_ranking[col] = pd.to_numeric(df_ranking[col], errors='coerce').fillna(0)
+    X = np.zeros((len(df_ranking), n))
+    for k, criterio in enumerate(criterios):
+        if criterio not in df_ranking.columns:
+            continue
+        vmax = df_ranking[criterio].max()
+        vmin = df_ranking[criterio].min()
+        if vmax == vmin:
+            continue
+        if criterio in CRITERIOS_DE_CUSTO:
+            X[:, k] = ((vmax - df_ranking[criterio]) / (vmax - vmin)).values
+        else:
+            X[:, k] = ((df_ranking[criterio] - vmin) / (vmax - vmin)).values
+
+    return {'df': df, 'criterios': criterios, 'matriz': matriz_saaty, 'X': X}
+
+
+def estimar_margem_ahp(df_bruto, posicao, niveis_usuario=None, n_sim=300, sigma=0.30, seed=42):
+    """Estima a margem de erro da Nota Moneyball devida à subjetividade dos pesos do AHP.
+
+    Os pesos vêm de julgamentos discretos de importância (níveis 1/2/3 → escala de
+    Saaty). Como esses julgamentos são subjetivos, perturbamos a matriz de comparação
+    par-a-par com ruído lognormal, recalculamos os pesos e as notas em `n_sim`
+    simulações e medimos a dispersão da nota de cada jogador. A escala do ruído cresce
+    com a Razão de Consistência (CR): julgamentos menos consistentes → maior incerteza.
+
+    Retorna dict: jogadores, nota (base), lo/hi (IC ~95%), margem (meia-largura),
+    cr, consistente, margem_media, n_sim.
+    """
+    prep = _preparar_ahp(df_bruto, posicao, niveis_usuario)
+    criterios, X, M = prep['criterios'], prep['X'], prep['matriz']
+    n = len(criterios)
+    pesos0, cr, consistente = ahp.calcular_pesos_ahp(M)
+    nota0 = 100.0 * (X @ pesos0)
+
+    base = {
+        'jogadores': prep['df']['Jogador'].values,
+        'nota': nota0, 'cr': float(cr), 'consistente': bool(consistente),
+    }
+    if n < 2 or len(X) == 0:
+        base.update({'lo': nota0, 'hi': nota0, 'margem': np.zeros(len(X)),
+                     'margem_media': 0.0, 'n_sim': 0})
+        return base
+
+    rng = np.random.default_rng(seed)
+    escala = sigma * (1.0 + 2.0 * min(float(cr), 0.5))
+    iu = np.triu_indices(n, k=1)
+    notas_sim = np.empty((n_sim, len(X)))
+    for s in range(n_sim):
+        Mp = M.copy()
+        fatores = np.exp(rng.normal(0.0, escala, size=iu[0].shape[0]))
+        Mp[iu] = M[iu] * fatores
+        Mp[(iu[1], iu[0])] = 1.0 / Mp[iu]  # mantém a reciprocidade da matriz
+        w, _, _ = ahp.calcular_pesos_ahp(Mp)
+        notas_sim[s] = 100.0 * (X @ w)
+
+    lo = np.percentile(notas_sim, 2.5, axis=0)
+    hi = np.percentile(notas_sim, 97.5, axis=0)
+    margem = (hi - lo) / 2.0
+    base.update({'lo': lo, 'hi': hi, 'margem': margem,
+                 'margem_media': float(np.mean(margem)), 'n_sim': int(n_sim)})
+    return base
+
+
 def gerar_rating_overall(df_bruto, posicao, niveis_usuario=None):
     """
     Calcula o Rating Overall para abas que não usam a lógica Moneyball

@@ -246,3 +246,216 @@ def _media_ponderada(df_metricas, pesos: pd.Series):
     num = (df_metricas.fillna(0.0) * pesos).sum(axis=1)
     den = (mask * pesos).sum(axis=1)
     return pd.Series(np.where(den > 0, num / den, 0.5), index=df_metricas.index)
+
+
+# ==========================================================================
+# CAMADA AVANÇADA — cálculo integral & diferencial sobre a DISTRIBUIÇÃO
+# dos jogadores da posição. Só numpy (KDE gaussiana, integração trapezoidal,
+# derivada da CDF). Ver docs/CONFIABILIDADE_METODOS.md para a teoria.
+# ==========================================================================
+COLS_MINUTOS = ["Minutos", "Minutos Jogados"]
+
+
+def _kde_grid(valores: np.ndarray):
+    """
+    Estima a densidade (KDE gaussiana) e a CDF (integral trapezoidal da densidade)
+    de uma métrica numa grade fina. Retorna (grid, densidade, cdf) ou None.
+
+    - Densidade:  f(x) = (1/n·h)·Σ φ((x−xⱼ)/h)   [derivável, suave]
+    - CDF:        F(x) = ∫₋∞ˣ f(t) dt            [integral cumulativa por trapézios]
+    Banda de Silverman robusta (usa min entre desvio-padrão e IQR/1.349).
+    """
+    v = np.asarray(valores, dtype=float)
+    v = v[np.isfinite(v)]
+    n = v.size
+    if n < 8 or np.nanstd(v) == 0:
+        return None
+    sd = v.std(ddof=1)
+    q75, q25 = np.percentile(v, [75, 25])
+    iqr = q75 - q25
+    sigma = min(sd, iqr / 1.349) if iqr > 0 else sd
+    h = 0.9 * sigma * n ** (-1 / 5)
+    if not np.isfinite(h) or h <= 0:
+        h = max(sd * n ** (-1 / 5), 1e-9)
+    grid = np.linspace(v.min() - 3 * h, v.max() + 3 * h, 512)
+    diff = (grid[:, None] - v[None, :]) / h
+    dens = np.exp(-0.5 * diff ** 2).sum(axis=1) / (n * h * np.sqrt(2 * np.pi))
+    # integral cumulativa (regra do trapézio) e normalização para [0,1]
+    cdf = np.concatenate([[0.0], np.cumsum((dens[1:] + dens[:-1]) / 2.0 * np.diff(grid))])
+    total = cdf[-1] if cdf[-1] > 0 else 1.0
+    cdf = cdf / total
+    return grid, dens, cdf
+
+
+def _confianca_por_minutos(n90: np.ndarray, escala: float = 8.0) -> np.ndarray:
+    """Confiança 0–1 a partir do nº de '90 minutos' jogados (saturação exponencial).
+    ~63% em escala*90 min. Integra a ideia de que amostra maior = estimativa firme."""
+    n90 = np.clip(np.asarray(n90, dtype=float), 0, None)
+    return 1.0 - np.exp(-n90 / escala)
+
+
+def calcular_avancado(df_posicao: pd.DataFrame, posicao: str):
+    """
+    Camada acadêmica da confiabilidade. Retorna um dict (ou None) com:
+      - df: [Jogador, Equipe, Score, Indice_Academico, Estabilidade,
+             Consistencia, Confianca, Banda] (todos 0–100, Banda em pontos ±)
+      - alavancas: {jogador: [(rótulo, alavanca 0–100), ...]}  (derivada do score)
+      - grids:    {rótulo: (grid, densidade, cdf, coluna)}     (para o gráfico KDE)
+      - valores:  DataFrame jogador × rótulo com o valor BRUTO de cada métrica
+      - sent:     {rótulo: +1|-1}
+      - usadas:   [rótulos]
+    Reaproveita a mesma config de métricas/pesos da confiabilidade base.
+    """
+    if posicao not in CONFIG_CONFIABILIDADE:
+        return None
+    if df_posicao is None or df_posicao.empty or "Jogador" not in df_posicao.columns:
+        return None
+
+    df = df_posicao.copy()
+    df = df[df["Jogador"].apply(lambda x: isinstance(x, str) and x.strip() != "")]
+    df = df.drop_duplicates(subset="Jogador", keep="first").reset_index(drop=True)
+    if len(df) < 8:
+        return None
+
+    metricas = CONFIG_CONFIABILIDADE[posicao]
+    jogadores = df["Jogador"].values
+
+    bom = {}        # goodness percentil suave (negativas invertidas), 0–1
+    densrel = {}    # densidade local relativa (0–1) -> fragilidade
+    dens_abs = {}   # densidade local absoluta (unidades 1/x) -> propagação de erro
+    brutos = {}     # valor bruto por métrica
+    grids = {}
+    pesos = {}
+    sent = {}
+    usadas = []
+
+    for m in metricas:
+        col = _achar_col(df, m["cols"])
+        if col is None:
+            continue
+        valores = _to_num(df[col])
+        kde = _kde_grid(valores.values)
+        if kde is None:
+            continue
+        grid, dens, cdf = kde
+        x = valores.values.astype(float)
+        # percentil suave = F(x) via interpolação na CDF integrada
+        perc = np.interp(x, grid, cdf, left=0.0, right=1.0)
+        f_abs = np.interp(x, grid, dens, left=0.0, right=0.0)  # densidade local = F'(x)
+        perc = np.where(np.isfinite(x), perc, np.nan)
+        g = perc if m["sentido"] == 1 else (1.0 - perc)
+        bom[m["label"]] = g
+        dens_abs[m["label"]] = f_abs
+        # densidade relativa (0–1) dentro da própria métrica -> "aglomeração"
+        dmax = np.nanmax(dens) if np.nanmax(dens) > 0 else 1.0
+        densrel[m["label"]] = np.clip(f_abs / dmax, 0, 1)
+        brutos[m["label"]] = x
+        grids[m["label"]] = (grid, dens, cdf, col)
+        pesos[m["label"]] = m["peso"]
+        sent[m["label"]] = m["sentido"]
+        usadas.append(m["label"])
+
+    if len(usadas) < 3:
+        return None
+
+    idx = df.index
+    df_bom = pd.DataFrame(bom, index=idx)
+    df_densrel = pd.DataFrame(densrel, index=idx)
+    df_densabs = pd.DataFrame(dens_abs, index=idx)
+    df_brutos = pd.DataFrame(brutos, index=idx)
+    w = pd.Series(pesos)
+    wsum = w.sum()
+
+    # ---- Score base (mesma fórmula, agora com percentil suave/integral) ----
+    mask = df_bom.notna()
+    score = np.where((mask * w).sum(axis=1) > 0,
+                     (df_bom.fillna(0.0) * w).sum(axis=1) / (mask * w).sum(axis=1), np.nan) * 100.0
+
+    # ---- Consistência (entropia de Shannon do perfil) ----
+    consist = _entropia_perfil(df_bom) * 100.0
+
+    # ---- Estabilidade (derivada da CDF: densidade local ponderada) ----
+    frag = np.where((mask * w).sum(axis=1) > 0,
+                    (df_densrel.fillna(0.0) * w).sum(axis=1) / (mask * w).sum(axis=1), 0.5)
+    estabilidade = (1.0 - frag) * 100.0
+
+    # ---- Confiança + banda (integração sobre incerteza amostral, método delta) ----
+    col_min = _achar_col(df, COLS_MINUTOS)
+    if col_min is not None:
+        minutos = _to_num(df[col_min]).values.astype(float)
+        n90 = np.where(np.isfinite(minutos), minutos / 90.0, 0.0)
+        confianca = _confianca_por_minutos(n90) * 100.0
+        rel_se = np.where(n90 > 0, 1.0 / np.sqrt(np.maximum(n90, 1e-9)), 1.0)  # ~erro relativo
+        # dg_i = f(x_i)·|x_i|·rel_se  (propagação do ruído da métrica ao percentil)
+        dg = df_densabs.mul(np.abs(df_brutos)).mul(rel_se, axis=0).clip(upper=1.0)
+        peso_norm = (w / wsum)
+        var_score = (dg.pow(2) * peso_norm.pow(2)).sum(axis=1)
+        banda = np.sqrt(var_score.values) * 100.0 * 1.96  # meia-largura ~IC 95%
+    else:
+        confianca = np.full(len(df), np.nan)
+        banda = np.full(len(df), np.nan)
+
+    # ---- Índice Acadêmico: score descontado por desequilíbrio e amostra pequena ----
+    fator_consist = 0.6 + 0.4 * (np.nan_to_num(consist, nan=100.0) / 100.0)
+    fator_conf = np.where(np.isfinite(confianca), 0.7 + 0.3 * (np.nan_to_num(confianca) / 100.0), 1.0)
+    indice_acad = np.clip(score * fator_consist * fator_conf, 0, 100)
+
+    df_out = pd.DataFrame({
+        "Jogador": jogadores,
+        "Equipe": df["Equipe"].values if "Equipe" in df.columns else "",
+        "Score": np.round(score, 1),
+        "Indice_Academico": np.round(indice_acad, 1),
+        "Estabilidade": np.round(estabilidade, 1),
+        "Consistencia": np.round(consist, 1),
+        "Confianca": np.round(confianca, 1),
+        "Banda": np.round(banda, 1),
+    }).sort_values("Indice_Academico", ascending=False).reset_index(drop=True)
+
+    # ---- Alavancagem (derivada ∂score/∂métrica = peso·densidade local) ----
+    alavancas = {}
+    lev = df_densrel.mul(w / wsum)  # contribuição marginal relativa por métrica
+    for i, jog in enumerate(jogadores):
+        linha = lev.iloc[i]
+        gi = df_bom.iloc[i]
+        # só faz sentido "melhorar" onde ainda há espaço (goodness < 0.9)
+        cand = [(lab, float(linha[lab])) for lab in usadas
+                if pd.notna(gi[lab]) and gi[lab] < 0.9 and pd.notna(linha[lab])]
+        cand.sort(key=lambda t: t[1], reverse=True)
+        top = cand[:3]
+        mx = max((v for _, v in top), default=0.0) or 1.0
+        alavancas[jog] = [(lab, round(v / mx * 100.0, 0)) for lab, v in top]
+
+    df_valores = df_brutos.copy()
+    df_valores.index = jogadores
+
+    return {
+        "df": df_out,
+        "alavancas": alavancas,
+        "grids": grids,
+        "valores": df_valores,
+        "sent": sent,
+        "usadas": usadas,
+    }
+
+
+def _entropia_perfil(df_bom: pd.DataFrame) -> np.ndarray:
+    """
+    Consistência via entropia de Shannon normalizada do perfil de percentis.
+    Para cada jogador: p_i = g_i / Σg_i ; H = −Σ p_i·ln(p_i) ; retorna H/ln(k) ∈ [0,1].
+    Alto = equilibrado em todas as dimensões; baixo = dependente de poucas métricas.
+    """
+    g = df_bom.values.astype(float)
+    out = np.zeros(g.shape[0])
+    for i in range(g.shape[0]):
+        gi = g[i]
+        gi = gi[np.isfinite(gi)]
+        k = gi.size
+        s = gi.sum()
+        if k < 2 or s <= 0:
+            out[i] = 0.0
+            continue
+        p = gi / s
+        p = p[p > 0]
+        h = -(p * np.log(p)).sum()
+        out[i] = h / np.log(k)
+    return out
