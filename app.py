@@ -8,6 +8,7 @@ import google.generativeai as genai
 import altair as alt
 import math
 from Funções import pix
+from Funções import confiabilidade as confi
 
 # Identificação do usuário via UUID persistido em query_params
 # (executado antes de qualquer outro código para garantir que o UUID existe)
@@ -271,6 +272,7 @@ SECOES_POR_MODO = {
     'posicoes': [
         ("📊", "Dashboard", "dashboard"),
         ("📈", "Comparativo", "comparativo"),
+        ("🛡️", "Confiabilidade", "confiabilidade"),
         ("🤖", "Olheiro IA", "scout"),
         ("🔍", "Ficha do Jogador", "ficha"),
         ("📋", "Planilha", "planilha"),
@@ -777,13 +779,23 @@ if not st.session_state['ja_calculou'] and 'banco_de_dados_completo' not in st.s
         st.markdown("### 🔄 Última atualização")
         st.space("small")
 
-        st.markdown('<span class="update-tag">v2.5 · Ago 2026</span>', unsafe_allow_html=True)
-        v25 = [
-            "Compatibilidade com diferentes versões da planilha — as posições agora são reconhecidas pelo nome da aba, independentemente do emoji (corrige posições que não apareciam para seleção)",
-            "Botão de download da planilha Moneyball (Allan FCL) na tela inicial",
+        st.markdown('<span class="update-tag">v2.6 · Set 2026</span>', unsafe_allow_html=True)
+        v26 = [
+            "Nova seção Confiabilidade — Score de Confiabilidade (0–100) por jogador, com métricas específicas de cada posição",
+            "Índice composto ponderado por percentis: compara o jogador contra os pares da mesma posição e penaliza mais os erros graves (ex.: erro que gera gol)",
+            "Barras de percentil por métrica, radar comparativo entre dois jogadores e matriz de risco (produção × erros)",
         ]
-        for n in v25:
+        for n in v26:
             st.markdown(f'<div class="update-item">• {n}</div>', unsafe_allow_html=True)
+
+        st.space("small")
+        with st.expander("📋 v2.5 · Ago 2026 — notas anteriores"):
+            v25 = [
+                "Compatibilidade com diferentes versões da planilha — as posições agora são reconhecidas pelo nome da aba, independentemente do emoji (corrige posições que não apareciam para seleção)",
+                "Botão de download da planilha Moneyball (Allan FCL) na tela inicial",
+            ]
+            for n in v25:
+                st.markdown(f'<div class="update-item">• {n}</div>', unsafe_allow_html=True)
 
         st.space("small")
         with st.expander("📋 v2.4 · Jun 2025 — notas anteriores"):
@@ -2180,6 +2192,152 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
+# ==========================================
+# HELPER: seção Confiabilidade (Score de Confiabilidade por posição)
+# ==========================================
+def _radar_confiabilidade(df_perc, jogador_a, jogador_b, plt):
+    """Radar (matplotlib) comparando os percentis de confiabilidade de 2 jogadores."""
+    import numpy as np
+    rotulos = list(df_perc.columns)
+    n = len(rotulos)
+    angulos = np.linspace(0, 2 * np.pi, n, endpoint=False).tolist()
+    angulos += angulos[:1]
+
+    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
+    fig.patch.set_facecolor('#0A0F0C')
+    ax.set_facecolor('#0A0F0C')
+
+    pares = [(jogador_a, '#22C55E')]
+    if jogador_b and jogador_b != jogador_a:
+        pares.append((jogador_b, '#38BDF8'))
+
+    for jog, cor in pares:
+        vals = df_perc.loc[jog].tolist()
+        vals += vals[:1]
+        ax.plot(angulos, vals, color=cor, linewidth=2, label=jog)
+        ax.fill(angulos, vals, color=cor, alpha=0.18)
+
+    ax.set_xticks(angulos[:-1])
+    ax.set_xticklabels(rotulos, fontsize=7, color='#CBD5E1')
+    ax.set_yticks([25, 50, 75, 100])
+    ax.set_yticklabels(['25', '50', '75', '100'], fontsize=6, color='#6B7280')
+    ax.set_ylim(0, 100)
+    ax.spines['polar'].set_color('#1E3A24')
+    ax.grid(color='#1E3A24', linewidth=0.8)
+    ax.set_title('Percentis de confiabilidade (0–100)', color='#E8F5E9', fontsize=11, pad=20)
+    ax.legend(loc='upper right', bbox_to_anchor=(1.28, 1.12), facecolor='#0A0F0C',
+              edgecolor='#1E3A24', labelcolor='#E8F5E9', fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
+def render_confiabilidade(posicao, df_da_posicao):
+    """Renderiza a seção de Score de Confiabilidade para uma posição."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+
+    st.subheader("🛡️ Score de Confiabilidade")
+    st.caption("Índice composto ponderado por percentis, comparando cada jogador contra os "
+               "pares da **mesma posição**. Métricas negativas (erros, posse perdida) são "
+               "invertidas: quanto maior o score, mais confiável.")
+
+    if not confi.posicao_suportada(posicao):
+        st.info("A análise de confiabilidade não está disponível para esta aba.")
+        return
+
+    df_scores, df_perc, usadas = confi.calcular_confiabilidade(df_da_posicao, posicao)
+    if df_scores is None:
+        st.warning("Dados insuficientes para calcular a confiabilidade desta posição "
+                   "(mínimo de jogadores ou de métricas não atingido).")
+        return
+
+    sent = {u['label']: u['sentido'] for u in usadas}
+    pos_labels = [l for l, s in sent.items() if s == 1]
+    neg_labels = [l for l, s in sent.items() if s == -1]
+
+    with st.expander("ℹ️ Como o score é calculado"):
+        st.markdown(f"""
+        - **Positivas (recompensa):** {', '.join(pos_labels)}
+        - **Negativas (penalidade, invertidas):** {', '.join(neg_labels)}
+        - Cada métrica vira **percentil dentro da posição** (0 = pior, 100 = melhor dos pares).
+        - As negativas pesam mais quando são erros graves (ex.: *erro que gera gol* pesa muito
+          mais que um passe errado).
+        - O **Score** é a média ponderada de todas as métricas; o **Índice Positivo** usa só as
+          de produção e o **Índice de Risco** só as de erro (usados na matriz de risco).
+        - ⚠️ *xT/EPV* exigem dados de evento que o FM não exporta — usamos *passes em progressão*
+          e *posse perdida* como proxy de progressão segura vs. arriscada.
+        """)
+
+    lider = df_scores.iloc[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("🥇 Mais confiável", str(lider['Jogador']), f"{lider['Score_Confiabilidade']:.0f}/100")
+    c2.metric("Índice positivo (líder)", f"{lider['Indice_Positivo']:.0f}")
+    c3.metric("Índice de risco (líder)", f"{lider['Indice_Risco']:.0f}", delta_color="inverse")
+
+    st.markdown("#### 📊 Ranking de confiabilidade")
+    col_cfg = {
+        'Score_Confiabilidade': st.column_config.ProgressColumn(
+            'Score', min_value=0, max_value=100, format='%.1f'),
+        'Indice_Positivo': st.column_config.NumberColumn('Produção', format='%.0f'),
+        'Indice_Risco': st.column_config.NumberColumn('Risco', format='%.0f'),
+    }
+    st.dataframe(df_scores, column_config=col_cfg, hide_index=True, use_container_width=True)
+
+    jogadores = df_scores['Jogador'].tolist()
+
+    # ---- 1) Barras de percentil ----
+    st.markdown("#### 📈 Percentis por métrica")
+    st.caption("Onde o jogador está frente aos pares (já ajustado para 'quanto maior, melhor').")
+    jogador_sel = st.selectbox("Jogador", jogadores, key=f"confi_bar_{posicao}")
+    serie = df_perc.loc[jogador_sel]
+    df_bars = pd.DataFrame({'Métrica': serie.index.tolist(), 'Percentil': serie.values})
+    df_bars['Tipo'] = df_bars['Métrica'].map(
+        lambda l: 'Positiva' if sent.get(l, 1) == 1 else 'Negativa (invertida)')
+    grafico_bars = alt.Chart(df_bars).mark_bar().encode(
+        x=alt.X('Percentil:Q', scale=alt.Scale(domain=[0, 100]), title='Percentil'),
+        y=alt.Y('Métrica:N', sort='-x', title=None),
+        color=alt.Color('Tipo:N',
+                        scale=alt.Scale(domain=['Positiva', 'Negativa (invertida)'],
+                                        range=['#22C55E', '#F59E0B']),
+                        legend=alt.Legend(title=None, orient='top')),
+        tooltip=['Métrica:N', alt.Tooltip('Percentil:Q', format='.0f'), 'Tipo:N'],
+    ).properties(height=max(200, 30 * len(df_bars)))
+    st.altair_chart(grafico_bars, use_container_width=True)
+
+    # ---- 2) Radar comparativo ----
+    st.markdown("#### 🎯 Comparativo (radar)")
+    cc1, cc2 = st.columns(2)
+    j_a = cc1.selectbox("Jogador A", jogadores, index=0, key=f"confi_radar_a_{posicao}")
+    j_b = cc2.selectbox("Jogador B", jogadores,
+                        index=1 if len(jogadores) > 1 else 0, key=f"confi_radar_b_{posicao}")
+    fig = _radar_confiabilidade(df_perc, j_a, j_b, plt)
+    st.pyplot(fig)
+    plt.close(fig)
+
+    # ---- 3) Matriz de risco ----
+    st.markdown("#### ⚠️ Matriz de risco")
+    st.caption("Canto **superior-esquerdo** = alta produção e baixo risco: os jogadores mais confiáveis.")
+    base = alt.Chart(df_scores).encode(
+        x=alt.X('Indice_Risco:Q', scale=alt.Scale(domain=[0, 100]), title='Índice de risco (erros) →'),
+        y=alt.Y('Indice_Positivo:Q', scale=alt.Scale(domain=[0, 100]), title='Índice positivo (produção) →'),
+    )
+    pontos = base.mark_circle(size=150, opacity=0.85).encode(
+        color=alt.Color('Score_Confiabilidade:Q', scale=alt.Scale(scheme='greens'), title='Score'),
+        tooltip=['Jogador:N', alt.Tooltip('Score_Confiabilidade:Q', format='.0f'),
+                 alt.Tooltip('Indice_Positivo:Q', format='.0f'),
+                 alt.Tooltip('Indice_Risco:Q', format='.0f')],
+    )
+    rotulos_pts = base.mark_text(align='left', dx=8, dy=-6, fontSize=10, color='#E8F5E9').encode(
+        text='Jogador:N')
+    reg_x = alt.Chart(pd.DataFrame({'x': [float(df_scores['Indice_Risco'].median())]})).mark_rule(
+        color='#6B7280', strokeDash=[4, 4]).encode(x='x:Q')
+    reg_y = alt.Chart(pd.DataFrame({'y': [float(df_scores['Indice_Positivo'].median())]})).mark_rule(
+        color='#6B7280', strokeDash=[4, 4]).encode(y='y:Q')
+    st.altair_chart((reg_x + reg_y + pontos + rotulos_pts).properties(height=460),
+                    use_container_width=True)
+
+
 # Abas disponíveis de acordo com o modo de análise escolhido
 modo_atual = st.session_state.get('modo_analise', 'posicoes')
 if modo_atual == 'posicoes':
@@ -2522,5 +2680,7 @@ for aba, posicao in zip(abas, posicoes_disponiveis):
                     col_config_pl['Nota média'] = st.column_config.ProgressColumn(
                         'Nota média FM', min_value=0, max_value=20, format='%.1f')
                 st.dataframe(df_bruta, column_config=col_config_pl, hide_index=True)
+        elif secao_ativa == "confiabilidade":
+            render_confiabilidade(posicao, df_da_posicao)
         else:
             render_secao(posicao, df_filtrado, df_da_posicao, secao_ativa)

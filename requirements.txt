@@ -4,6 +4,7 @@ numpy
 openpyxl
 google.generativeai
 altair
+matplotlib
 supabase
 qrcode
 pillow
